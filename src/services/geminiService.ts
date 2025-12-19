@@ -133,7 +133,6 @@ const RESPONSE_SCHEMA: Schema = {
 };
 
 // Helper to compress and convert file to base64
-// This significantly reduces token count and upload time
 const compressAndConvertToBase64 = (file: File): Promise<string> => {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -146,7 +145,6 @@ const compressAndConvertToBase64 = (file: File): Promise<string> => {
         const ctx = canvas.getContext('2d');
         
         // INCREASED MAX_SIZE: 1500 -> 3072
-        // Allows reading long scrolling screenshots without losing text clarity
         const MAX_SIZE = 3072; 
         let width = img.width;
         let height = img.height;
@@ -165,13 +163,11 @@ const compressAndConvertToBase64 = (file: File): Promise<string> => {
 
         canvas.width = width;
         canvas.height = height;
-        // White background in case of transparent PNGs
         if (ctx) {
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(img, 0, 0, width, height);
             
-            // INCREASED QUALITY: 0.95 to ensure text/numbers are sharp for OCR
             const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
             resolve(dataUrl.split(',')[1]);
         } else {
@@ -184,34 +180,80 @@ const compressAndConvertToBase64 = (file: File): Promise<string> => {
   });
 };
 
-export const analyzeScreenshot = async (files: File[]): Promise<AnalysisResult> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- ERROR HANDLING & RETRY LOGIC ---
 
-  // Process all files concurrently with compression
-  const imageParts = await Promise.all(files.map(async (file) => {
-    const base64 = await compressAndConvertToBase64(file);
-    return {
-      inlineData: {
-        mimeType: 'image/jpeg', // Always converting to JPEG
-        data: base64
+const mapFriendlyError = (error: any) => {
+  const msg = error?.message || error?.toString() || "";
+  const code = error?.status || error?.response?.status;
+  
+  if (code === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED")) {
+    return new Error("⚠️ API Kotası Aşıldı (429): Google Gemini ücretsiz kullanım limitine takıldınız. Lütfen 1-2 dakika bekleyip tekrar deneyin.");
+  }
+  
+  if (msg.includes("503") || msg.includes("overloaded")) {
+    return new Error("⚠️ Sunucu Yoğunluğu: Google sunucuları şu an çok yoğun. Lütfen biraz sonra tekrar deneyin.");
+  }
+
+  return error;
+};
+
+const retryOperation = async <T>(operation: () => Promise<T>, maxRetries: number = 3, baseDelay: number = 2000): Promise<T> => {
+  let lastError: any;
+  
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      lastError = error;
+      
+      const msg = error?.message || error?.toString() || "";
+      const isQuotaError = msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+
+      // If it's a quota error, we wait and retry
+      if (isQuotaError && i < maxRetries) {
+        const delay = baseDelay * Math.pow(2, i); // 2s, 4s, 8s
+        console.warn(`API Quota hit. Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries + 1})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
       }
-    };
-  }));
+      
+      // For other errors, we might fail fast or could retry too depending on strategy.
+      // Here we fail fast for non-quota errors.
+      throw mapFriendlyError(error);
+    }
+  }
+  throw mapFriendlyError(lastError);
+};
 
-  try {
+// --- MAIN EXPORTS ---
+
+export const analyzeScreenshot = async (files: File[]): Promise<AnalysisResult> => {
+  return retryOperation(async () => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const imageParts = await Promise.all(files.map(async (file) => {
+      const base64 = await compressAndConvertToBase64(file);
+      return {
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: base64
+        }
+      };
+    }));
+
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview", 
       contents: {
         parts: [
-          ...imageParts, // Spread all image parts
+          ...imageParts,
           { text: IMAGE_ANALYSIS_PROMPT }
         ]
       },
       config: {
         responseMimeType: "application/json",
         responseSchema: RESPONSE_SCHEMA,
-        temperature: 0.0, // ZERO TEMPERATURE: Disables creativity, forces strict data extraction
-        tools: [{ googleSearch: {} }] // Enabled for stats search
+        temperature: 0.0,
+        tools: [{ googleSearch: {} }]
       }
     });
 
@@ -219,17 +261,13 @@ export const analyzeScreenshot = async (files: File[]): Promise<AnalysisResult> 
     if (!text) throw new Error("Yapay zekadan yanıt alınamadı");
     
     return JSON.parse(text) as AnalysisResult;
-
-  } catch (error) {
-    console.error("Gemini Analiz Hatası (Resim):", error);
-    throw error;
-  }
+  });
 };
 
 export const analyzeDailyBulletin = async (): Promise<AnalysisResult> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  return retryOperation(async () => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-  try {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: {
@@ -249,8 +287,5 @@ export const analyzeDailyBulletin = async (): Promise<AnalysisResult> => {
     if (!text) throw new Error("Yapay zekadan yanıt alınamadı");
 
     return JSON.parse(text) as AnalysisResult;
-  } catch (error) {
-    console.error("Gemini Analiz Hatası (Web):", error);
-    throw error;
-  }
+  });
 };
